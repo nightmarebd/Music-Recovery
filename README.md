@@ -39,3 +39,4 @@ It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBra
 ```bash
 git clone https://github.com/nightmarebd/track_fix.git
 cd track_fix
+bash track_fix.git
