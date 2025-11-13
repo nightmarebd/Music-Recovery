@@ -59,6 +59,7 @@ echo " State file: $STATE_FILE"
 echo " Log file: $LOG_FILE"
 echo ""
 
+# ✅ Default to “Y” on Enter
 read -rp "Proceed and run TrackFix now? [Y/n]: " CONFIRM
 CONFIRM=${CONFIRM:-Y}
 [[ "$CONFIRM" =~ ^[Yy]$ ]] || exit 0
@@ -75,14 +76,12 @@ pip install rich mutagen pillow requests > /dev/null
 
 # --- Run the embedded Python code ---
 python3 - <<'PYCODE'
-import os, sys, threading, queue, time, random, pathlib
+import os, sys, threading, queue, time, random
 from rich.console import Console
 from rich.live import Live
 from rich.table import Table
 from rich.panel import Panel
-from rich.text import Text
 from rich import box
-from rich.progress import Progress, SpinnerColumn, TextColumn, BarColumn, TimeElapsedColumn
 from datetime import datetime
 
 console = Console()
@@ -127,7 +126,6 @@ def worker(tid):
         thread_status[tid]["file"] = f
         thread_status[tid]["count"] += 1
         stats["processed"] += 1
-
         time.sleep(random.uniform(0.05, 0.25))
         action = random.choice(["recovered","renamed","failed","skipped"])
         stats[action] += 1
@@ -145,7 +143,7 @@ def generate_table():
     return table
 
 def build_dashboard():
-    status = f"[green]Processed: {stats['processed']}[/green] | [cyan]Recovered: {stats['recovered']}[/cyan] | [yellow]Renamed: {stats['renamed']}[/yellow] | [magenta]Simulated: {stats['simulated']}[/magenta] | [red]Skipped: {stats['skipped']}[/red] | [red]Failed: {stats['failed']}[/red] | [red]Corrupted: {stats['corrupted']}[/red]"
+    status = f"[green]Processed:[/green] {stats['processed']} | [cyan]Recovered:[/cyan] {stats['recovered']} | [yellow]Renamed:[/yellow] {stats['renamed']} | [magenta]Simulated:[/magenta] {stats['simulated']} | [red]Skipped:[/red] {stats['skipped']} | [red]Failed:[/red] {stats['failed']} | [red]Corrupted:[/red] {stats['corrupted']}"
     panel = Panel(status, title="NightmareBD — TrackFix (Final Build)", border_style="blue")
     layout = Table.grid(expand=True)
     layout.add_row(panel)
@@ -153,7 +151,6 @@ def build_dashboard():
     layout.add_row(Panel(fade_logs(), title="Log tail", border_style="gray"))
     return layout
 
-# --- Discover files ---
 for root, _, files in os.walk(MUSIC_DIR):
     for fn in files:
         if fn.lower().endswith((".mp3", ".flac", ".wav", ".m4a")):
