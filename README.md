@@ -7,7 +7,6 @@ It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBra
 
 ## Features
 
-- **NightmareBD ASCII banner** on startup.
 - **Dynamic music folder selection** at runtime.
 - **Resumable** using `.processed_files.json` to continue after crashes.
 - **Multi-threaded processing** (8 threads by default) for speed.
@@ -38,5 +37,5 @@ It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBra
 
 ```bash
 git clone https://github.com/nightmarebd/Music-Recovery/blob/main/track_fix.sh
-cd track_fix
+cd Music-Recovery
 bash track_fix.git
