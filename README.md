@@ -36,6 +36,6 @@ It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBra
 1. Clone this repository:
 
 ```bash
-git clone https://github.com/nightmarebd/Music-Recovery/blob/main/track_fix.sh
+git clone https://github.com/nightmarebd/Music-Recovery.git
 cd Music-Recovery
-bash track_fix.git
+bash track_fix.sh
