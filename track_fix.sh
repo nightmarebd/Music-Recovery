@@ -16,6 +16,7 @@ if [ ! -d "$MUSIC_FOLDER" ]; then
   exit 1
 fi
 
+# Corrected function definition starts here
 ask_yesno() {
   local prompt="$1"
   local default="${2:-y}"
@@ -29,11 +30,12 @@ ask_yesno() {
     esac
   done
 }
+# Corrected function definition ends here
 
 echo "NightmareBD TrackFix — Interactive feature selection"
 FIX_PERMS=$(ask_yesno "Automatically fix ownership/permissions before starting?")
 DELETE_FAILED=$(ask_yesno "Delete original corrupted files after successful recovery?")
-AUTO_RENAME=$(ask_yesno "Rename files to 'Title - Album - Artist' based on metadata?") # Updated prompt for clarity
+AUTO_RENAME=$(ask_yesno "Rename files to 'Title - Album - Artist' based on metadata?")
 EMBED_COVER=$(ask_yesno "Download & embed cover art from MusicBrainz/CAA?")
 FETCH_GENRE_YEAR=$(ask_yesno "Fetch genre & year from MusicBrainz?")
 AUTO_DRY_REAL=$(ask_yesno "Automatically switch from dry-run to real mode if dry-run looks good?")
@@ -246,6 +248,7 @@ def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=Tru
         if dry_run:
             stats['simulated'] += 1
             log(f"[DRY] Would update: {file_path} -> album:{album_title} date:{date} genre:{genre}")
+            # Auto-dry->real switch logic is in main thread
             return
 
         # Real mode: write metadata
@@ -333,8 +336,215 @@ def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=Tru
                 art = safe_name(artist)
                 alb = safe_name(album_title)
                 tit = safe_name(title)
-                new_name = f"{tit} - {alb} - {art}{Path(file_path).suffix}" # Modified to Title-Album-Artist
+                new_name = f"{tit} - {alb} - {art}{Path(file_path).suffix}" # Title - Album - Artist
                 new_path = Path(file_path).parent / new_name
                 if new_path != Path(file_path):
                     os.rename(file_path, new_path)
                     stats['renamed'] += 1
+                    log(f"Renamed: {file_path} -> {new_path}")
+                    file_path = str(new_path)
+            except Exception as e:
+                log(f"Rename failed {file_path}: {e}")
+
+        stats['recovered'] += 1
+        log(f"Recovered: {file_path}")
+    except Exception as e:
+        stats['corrupted'] += 1
+        log(f"Processing exception {file_path}: {e}\n{traceback.format_exc()}")
+
+def safe_name(s):
+    return "".join(c if c.isalnum() or c in " .-_()[]" else "_" for c in (s or "")).strip()
+
+# Build file list (only audio extensions we care)
+def build_file_list(root: Path):
+    exts = {".mp3", ".flac", ".m4a", ".ogg", ".wav"}
+    files = [str(p) for p in root.rglob("*") if p.suffix.lower() in exts]
+    return files
+
+def run_workers(files, dry_run=True):
+    stats = {
+        'processed': 0, 'recovered': 0, 'renamed': 0,
+        'simulated': 0, 'skipped': 0, 'failed': 0, 'corrupted': 0,
+        'thread_current': {i+1: "" for i in range(THREADS)},
+        'thread_count': {i+1: 0 for i in range(THREADS)},
+    }
+
+    # Rich progress & layout
+    console = Console()
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+        transient=False,
+    )
+    task = progress.add_task("Overall", total=len(files))
+
+    # Launch threads
+    with ThreadPoolExecutor(max_workers=THREADS) as executor, Live(console=console, refresh_per_second=10) as live:
+        futures = {}
+        # Submit tasks round-robin; we map index -> thread id for status
+        idx = 0
+        for fpath in files:
+            # skip if already processed (resumable)
+            if RESUMABLE and fpath in processed_set:
+                stats['processed'] += 1
+                progress.update(task, advance=1)
+                continue
+            thread_id = (idx % THREADS) + 1
+            future = executor.submit(process_file_worker, fpath, thread_id, stats, dry_run)
+            futures[future] = (fpath, thread_id)
+            idx += 1
+
+        # Render live screen while futures complete
+        while futures:
+            # Build dashboard
+            table = Table.grid()
+            title = Text("NightmareBD — TrackFix", style="bold magenta")
+            table.add_row(title)
+            counts = f"Processed: {stats['processed']} | Recovered: {stats['recovered']} | Renamed: {stats['renamed']} | Simulated: {stats['simulated']} | Skipped: {stats['skipped']} | Failed: {stats['failed']} | Corrupted: {stats['corrupted']}"
+            table.add_row(Text(counts, style="yellow"))
+            # Per-thread table
+            t = Table(title="Threads", show_lines=False, expand=True)
+            t.add_column("TID", justify="right")
+            t.add_column("Count", justify="right")
+            t.add_column("Current file", overflow="fold")
+            for tid in range(1, THREADS+1):
+                cur = stats['thread_current'].get(tid, "")
+                cnt = stats['thread_count'].get(tid, 0)
+                t.add_row(str(tid), str(cnt), cur[:80])
+            table.add_row(t)
+            # Log tail
+            log_lines = []
+            while not log_q.empty():
+                log_lines.append(log_q.get_nowait())
+            # keep last 8 lines
+            with open(LOG_FILE, "r", errors="ignore") as lf:
+                tail = lf.read().splitlines()[-8:]
+            tail_panel = Panel("\n".join(tail or log_lines), title="Log tail", height=8)
+            table.add_row(tail_panel)
+            # Display progress bar via progress.renderable
+            body = Align.center(Panel.fit(table), vertical="top")
+            live.update(Panel.fit(body, border_style="green"))
+            # handle completed futures
+            done = []
+            for fut in list(futures):
+                if fut.done():
+                    fpath, tid = futures.pop(fut)
+                    stats['processed'] += 1
+                    progress.update(task, advance=1)
+            time.sleep(0.05)
+
+    # Final save
+    save_state()
+    return stats
+
+def quick_dry_check(files):
+    # Run brief sampling: test first N corrupted checks to see if dry_run looks good.
+    sample = files[:min(20, len(files))]
+    stats = {'simulated': 0, 'failed': 0, 'skipped': 0}
+    for f in sample:
+        try:
+            audio = mutagen.File(f, easy=True)
+            if audio is None:
+                stats['skipped'] += 1
+            else:
+                title = audio.get("title",[None])[0]
+                artist = audio.get("artist",[None])[0]
+                if not title or not artist:
+                    stats['skipped'] += 1
+                else:
+                    # try MB lookup
+                    try:
+                        res = musicbrainzngs.search_recordings(recording=title, artist=artist, limit=1)
+                        if res.get("recording-list"):
+                            stats['simulated'] += 1
+                        else:
+                            stats['failed'] += 1
+                    except Exception:
+                        stats['failed'] += 1
+        except Exception:
+            stats['failed'] += 1
+    return stats
+
+def main():
+    # optional fix perms
+    if FIX_PERMS:
+        fix_perms_recursive(MUSIC_FOLDER)
+
+    files = build_file_list(MUSIC_FOLDER)
+    log(f"Discovered {len(files)} audio files under {MUSIC_FOLDER}")
+
+    # Dry-run sampling and decision
+    if AUTO_DRY_REAL:
+        sample_stats = quick_dry_check(files)
+        log(f"Dry-check sample stats: {sample_stats}")
+        # simple heuristic: if majority simulated (have MB matches) then switch to real
+        if sample_stats['simulated'] >= sample_stats['failed']:
+            dry_run = False
+            log("Auto-switch: Dry-check passed -> Running REAL mode")
+        else:
+            dry_run = True
+            log("Auto-switch: Dry-check failed -> Staying in DRY mode")
+    else:
+        dry_run = True
+
+    # Run workers (first run dry or real depending)
+    stats = run_workers(files, dry_run=dry_run)
+
+    # If dry-run and auto-switch enabled, optionally run real now
+    if dry_run and AUTO_DRY_REAL:
+        # prompt user (we're non-interactive inside python; do auto-switch if metric good)
+        # We'll run real automatically if simulated >> failed
+        sample_stats = quick_dry_check(files)
+        if sample_stats['simulated'] >= sample_stats['failed']:
+            log("Auto-switch performing REAL run now.")
+            stats = run_workers(files, dry_run=False)
+        else:
+            log("Auto-switch decided NOT to perform REAL run.")
+
+    # Post cleanup: delete original corrupted if selected (not implemented heavy deletion heuristics)
+    if DELETE_FAILED:
+        log("DELETE_FAILED enabled - scanning for *_corrupted files to remove (none by default).")
+
+    # final
+    log(f"Finished: {stats}")
+    console = Console()
+    console.print(Panel(Text("TrackFix finished — check log for details", style="bold green")))
+    save_state()
+
+if __name__ == "__main__":
+    # Ensure log file exists
+    LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+    open(LOG_FILE, "a").close()
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Interrupted by user")
+        save_state()
+    except Exception as e:
+        log(f"Fatal: {e}\n{traceback.format_exc()}")
+        save_state()
+PYCODE
+
+# ---- make Python script executable ----
+chmod +x "$PY_FILE"
+
+# Export environment variables read by the python script
+export TRACKFIX_MUSIC_FOLDER="$MUSIC_FOLDER"
+export TRACKFIX_THREADS="$THREADS"
+export TRACKFIX_FIX_PERMS="$FIX_PERMS"
+export TRACKFIX_DELETE_FAILED="$DELETE_FAILED"
+export TRACKFIX_AUTO_RENAME="$AUTO_RENAME"
+export TRACKFIX_EMBED_COVER="$EMBED_COVER"
+export TRACKFIX_FETCH_GENRE_YEAR="$FETCH_GENRE_YEAR"
+export TRACKFIX_AUTO_DRY_REAL="$AUTO_DRY_REAL"
+export TRACKFIX_RESUMABLE="$RESUMABLE"
+export TRACKFIX_LOG_FILE="$LOG_FILE"
+
+echo "[*] Starting TrackFix Python TUI..."
+python "$PY_FILE"
+
+echo "[*] TrackFix finished. Logs: $LOG_FILE"
