@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# track_fix.sh - NightmareBD TrackFix (Final TUI build with fading logs and error/warning highlights)
+# track_fix.sh - NightmareBD TrackFix (self-contained final TUI build)
 # Usage: ./track_fix.sh
 
 set -euo pipefail
@@ -74,11 +74,12 @@ echo "[*] Installing Python packages..."
 pip install --upgrade pip >/dev/null
 pip install mutagen musicbrainzngs requests Pillow rich tqdm >/dev/null
 
-# ----- Write embedded Python TUI (Final colorful version with fading logs + highlights) -----
+# ----- Write embedded Python TUI (Final colorful version) -----
 cat > "$PY_FILE" <<'PYCODE'
 #!/usr/bin/env python3
 """
-TrackFix Python TUI - Final self-contained build with fading logs and error/warning highlights
+TrackFix Python TUI - Final self-contained build
+Colorful per-thread live dashboard with fading logs and smooth updates
 """
 
 import os, sys, json, time, threading, traceback
@@ -118,31 +119,20 @@ RESUMABLE = True
 musicbrainzngs.set_useragent("TrackFix","1.0","trackfix@example.com")
 console = Console()
 log_q = Queue()
-THREAD_COLORS = cycle(["cyan","magenta","green","yellow","blue","red","bright_cyan","bright_magenta"])
-MAX_LOG_LINES = 20
-recent_logs = []
 
-def highlight_line(line):
-    # Subtle color highlights
-    if any(k in line for k in ["SKIP","FAILED","CORRUPTED","EXCEPTION"]):
-        return f"[red]{line}[/red]"
-    if "[DRY]" in line:
-        return f"[yellow]{line}[/yellow]"
-    return line
+THREAD_COLORS = cycle(["cyan","magenta","green","yellow","blue","red","bright_cyan","bright_magenta"])
 
 def log(msg):
     ts = time.strftime("%H:%M:%S")
-    line = f"[{ts}] {msg}"
-    log_q.put(line)
-    recent_logs.append(line)
-    if len(recent_logs) > MAX_LOG_LINES: recent_logs.pop(0)
-    with open(LOG_FILE, "a") as f: f.write(line+"\n")
+    log_q.put(f"[{ts}] {msg}")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
 
 def fix_perms_recursive(path):
     try:
         for p in path.rglob("*"):
             try: p.chmod(0o777)
-            except: pass
+            except Exception: pass
         log(f"Fixed permissions recursively under {path}")
     except Exception as e: log(f"fix_perms error: {e}")
 
@@ -152,7 +142,7 @@ if STATE_FILE.exists():
     try:
         with STATE_FILE.open("r") as f:
             processed_set = set(json.load(f))
-    except: processed_set = set()
+    except Exception: processed_set = set()
 else:
     processed_set = set()
 
@@ -171,7 +161,6 @@ def fetch_cover(release_mbid):
     except Exception as e: log(f"Cover fetch error {release_mbid}: {e}")
     return None
 
-# ---- Worker ----
 def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=True):
     stats['thread_current'][thread_id]=file_path
     stats['thread_count'][thread_id]+=1
@@ -182,9 +171,9 @@ def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=Tru
         if not title or not artist: stats['skipped']+=1; log(f"SKIP no title/artist: {file_path}"); return
         try:
             res=musicbrainzngs.search_recordings(recording=title, artist=artist, limit=1)
-        except Exception as e: stats['failed']+=1; log(f"FAILED MB search {file_path}: {e}"); return
+        except Exception as e: stats['failed']+=1; log(f"MB search error {file_path}: {e}"); return
         recs=res.get("recording-list",[])
-        if not recs: stats['failed']+=1; log(f"FAILED MB no match: {file_path}"); return
+        if not recs: stats['failed']+=1; log(f"MB no match: {file_path}"); return
         rec=recs[0]; release=rec.get("release-list",[{}])[0]
         album_title=release.get("title","Unknown Album"); date=release.get("date",None)
         tags=release.get("tag-list",[]); genre=", ".join(tag.get("name") for tag in tags) if tags else None
@@ -195,7 +184,7 @@ def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=Tru
             ext=Path(file_path).suffix.lower()
             if ext==".mp3":
                 try:id3=ID3(file_path)
-                except:id3=ID3()
+                except Exception:id3=ID3()
                 audio["album"]=album_title; audio["date"]=date; audio["genre"]=genre; audio.save()
                 if EMBED_COVER and release_mbid:
                     img=fetch_cover(release_mbid)
@@ -216,23 +205,21 @@ def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=Tru
                         elif ext in (".m4a",".mp4"): mp4=MP4(file_path); mp4["covr"]=[MP4Cover(img,MP4Cover.FORMAT_JPEG)]; mp4.save()
                 try: audio.save()
                 except: pass
-        except Exception as e: stats['failed']+=1; log(f"FAILED Write {file_path}: {e}"); return
+        except Exception as e: stats['failed']+=1; log(f"Write error {file_path}: {e}"); return
         if AUTO_RENAME:
             try:
                 tit=safe_name(title); alb=safe_name(album_title); art=safe_name(artist)
                 new_name=f"{tit} - {alb} - {art}{Path(file_path).suffix}"
                 new_path=Path(file_path).parent/new_name
                 if new_path!=Path(file_path): os.rename(file_path,new_path); stats['renamed']+=1; log(f"Renamed: {file_path} -> {new_path}"); file_path=str(new_path)
-            except Exception as e: log(f"FAILED Rename {file_path}: {e}")
+            except Exception as e: log(f"Rename failed {file_path}: {e}")
         stats['recovered']+=1; log(f"Recovered: {file_path}")
-    except Exception as e: stats['corrupted']+=1; log(f"CORRUPTED {file_path}: {e}\n{traceback.format_exc()}")
+    except Exception as e: stats['corrupted']+=1; log(f"Exception {file_path}: {e}\n{traceback.format_exc()}")
 
-# ---- Build file list ----
 def build_file_list(root: Path):
     exts={".mp3",".flac",".m4a",".ogg",".wav"}
     return [str(p) for p in root.rglob("*") if p.suffix.lower() in exts]
 
-# ---- Run workers with fading logs and highlights ----
 def run_workers(files,dry_run=True):
     colors=cycle(["cyan","magenta","green","yellow","blue","red","bright_cyan","bright_magenta"])
     stats={'processed':0,'recovered':0,'renamed':0,'simulated':0,'skipped':0,'failed':0,'corrupted':0,
@@ -250,28 +237,24 @@ def run_workers(files,dry_run=True):
             futures[executor.submit(process_file_worker,fpath,thread_id,stats,dry_run)]=(fpath,thread_id)
             idx+=1
         while futures:
-            table=Table.grid()
-            title=Text("NightmareBD — TrackFix (Final Build)",style="bold magenta")
-            table.add_row(title)
+            table=Table.grid(); title=Text("NightmareBD — TrackFix (Final Build)",style="bold magenta"); table.add_row(title)
             counts=f"[green]Processed: {stats['processed']}[/green] | [cyan]Recovered: {stats['recovered']}[/cyan] | [yellow]Renamed: {stats['renamed']}[/yellow] | [magenta]Simulated: {stats['simulated']}[/magenta] | [red]Skipped: {stats['skipped']}[/red] | [red]Failed: {stats['failed']}[/red] | [red]Corrupted: {stats['corrupted']}[/red]"
             table.add_row(Text(counts))
-            t=Table(title="Threads", show_lines=False, expand=True)
-            t.add_column("TID",justify="right"); t.add_column("Count",justify="right"); t.add_column("Current file",overflow="fold")
+            t=Table(title="Threads", show_lines=False, expand=True); t.add_column("TID",justify="right"); t.add_column("Count",justify="right"); t.add_column("Current file",overflow="fold")
             for tid in range(1,THREADS+1):
                 cur=stats['thread_current'].get(tid,""); cnt=stats['thread_count'].get(tid,0); color=stats['thread_color'][tid]
                 t.add_row(Text(str(tid),style=color),Text(str(cnt),style=color),Text(cur[:80],style=color))
             table.add_row(t)
-            # Fading log panel with highlights
-            log_panel_text=""
-            for idx,line in enumerate(recent_logs):
-                fade=max(0.3,(idx+1)/len(recent_logs))
-                hl=highlight_line(line)
-                log_panel_text+=f"[color({int(fade*255)})]{hl}[/color]\n"
-            table.add_row(Panel(log_panel_text.rstrip(),title="Recent Log",height=10))
+            log_lines=[]
+            while not log_q.empty(): log_lines.append(log_q.get_nowait())
+            with open(LOG_FILE,"r",errors="ignore") as lf: tail=lf.read().splitlines()[-8:]
+            table.add_row(Panel("\n".join(tail or log_lines), title="Log tail",height=8))
             body=Align.center(Panel.fit(table),vertical="top")
             live.update(Panel.fit(body,border_style="green"))
+            done=[]
             for fut in list(futures):
-                if fut.done(): fpath,tid=futures.pop(fut); stats['processed']+=1; progress.update(task,advance=1)
+                if fut.done():
+                    fpath,tid=futures.pop(fut); stats['processed']+=1; progress.update(task,advance=1)
             time.sleep(0.05)
     save_state(); return stats
 
@@ -308,6 +291,6 @@ export TRACKFIX_AUTO_DRY_REAL="$AUTO_DRY_REAL"
 export TRACKFIX_RESUMABLE="true"
 export TRACKFIX_LOG_FILE="$LOG_FILE"
 
-echo "[*] Starting TrackFix Python TUI (Final Build with fading logs & highlights)..."
+echo "[*] Starting TrackFix Python TUI (Final Build)..."
 python "$PY_FILE"
 echo "[*] TrackFix finished. Logs: $LOG_FILE"
