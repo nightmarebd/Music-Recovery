@@ -1,161 +1,363 @@
-#!/bin/bash
-# ==============================================================
-# 🩸 NightmareBD — TrackFix
-# Fully Automated Music Metadata Recovery & Renaming Engine
-# ==============================================================
-# Only change: file rename format → Title - Album - Artist
-# ==============================================================
+#!/usr/bin/env bash
+# track_fix.sh - Interactive TrackFix (NightmareBD) generator + runner
+# Produces: ./trackfix_tui.py and runs it in a venv
+#
+# Usage: ./track_fix.sh
+# Default music folder: /mnt/HDD/Media/Music
 
-set -e
-MUSIC_DIR="/mnt/HDD/Media/Music"
+set -euo pipefail
+
+# ----- Config / prompts -----
+DEFAULT_MUSIC_FOLDER="/mnt/HDD/Media/Music"
+read -p "Music folder [${DEFAULT_MUSIC_FOLDER}]: " MUSIC_FOLDER
+MUSIC_FOLDER="${MUSIC_FOLDER:-$DEFAULT_MUSIC_FOLDER}"
+if [ ! -d "$MUSIC_FOLDER" ]; then
+  echo "Error: folder does not exist: $MUSIC_FOLDER"
+  exit 1
+fi
+
+ask_yesno() {
+  local prompt="$1"
+  local default="${2:-y}"
+  while true; do
+    read -p "$prompt [y/n] (default: $default): " ans
+    ans="${ans:-$default}"
+    case "$ans" in
+      [Yy]*) echo "true"; return ;;
+      [Nn]*) echo "false"; return ;;
+      *) echo "Please answer y or n." ;;
+    esac
+  done
+}
+
+echo "NightmareBD TrackFix — Interactive feature selection"
+FIX_PERMS=$(ask_yesno "Automatically fix ownership/permissions before starting?")
+DELETE_FAILED=$(ask_yesno "Delete original corrupted files after successful recovery?")
+AUTO_RENAME=$(ask_yesno "Rename files to 'Title - Album - Artist' based on metadata?")
+EMBED_COVER=$(ask_yesno "Download & embed cover art from MusicBrainz/CAA?")
+FETCH_GENRE_YEAR=$(ask_yesno "Fetch genre & year from MusicBrainz?")
+AUTO_DRY_REAL=$(ask_yesno "Automatically switch from dry-run to real mode if dry-run looks good?")
+RESUMABLE="true"   # always on
+read -p "Worker threads (recommended 6-12) [8]: " THREADS
+THREADS="${THREADS:-8}"
+
+# Other runtime files
 VENV_DIR="./trackfix_env"
-STATE_FILE=".trackfix_state.json"
+PY_FILE="./trackfix_tui.py"
+STATE_FILE="${MUSIC_FOLDER}/.trackfix_state.json"
 LOG_FILE="./trackfix.log"
 
-clear
-echo "────────────────────────────────────────────"
-echo "🎧  NightmareBD TrackFix — Music Recovery"
-echo "────────────────────────────────────────────"
-echo "Music folder: $MUSIC_DIR"
-echo "Virtualenv:   $VENV_DIR"
-echo "State file:   $STATE_FILE"
-echo "Log file:     $LOG_FILE"
-echo "────────────────────────────────────────────"
+echo "Settings:"
+cat <<EOF
+ Music folder: $MUSIC_FOLDER
+ Fix perms: $FIX_PERMS
+ Delete failed originals: $DELETE_FAILED
+ Auto rename: $AUTO_RENAME
+ Embed cover art: $EMBED_COVER
+ Fetch genre/year: $FETCH_GENRE_YEAR
+ Auto dry->real switch: $AUTO_DRY_REAL
+ Threads: $THREADS
+ Resumable: $RESUMABLE
+ State file: $STATE_FILE
+ Log file: $LOG_FILE
+EOF
 
-# --- Auto fix permissions before anything ---
-echo "[*] Fixing ownership and permissions recursively..."
-chown -R nobody:nogroup "$MUSIC_DIR" 2>/dev/null || true
-chmod -R 777 "$MUSIC_DIR" 2>/dev/null || true
+read -p "Proceed and generate/run TrackFix now? [Y/n]: " proceed
+proceed="${proceed:-Y}"
+if [[ ! "$proceed" =~ ^[Yy] ]]; then
+  echo "Aborted."
+  exit 0
+fi
 
-# --- Ensure Python virtualenv ---
+# ----- Prepare venv and dependencies -----
+echo "[*] Ensure venv: $VENV_DIR"
 if [ ! -d "$VENV_DIR" ]; then
-  echo "[*] Creating virtual environment..."
   python3 -m venv "$VENV_DIR"
 fi
 
+# shellcheck disable=SC1091
 source "$VENV_DIR/bin/activate"
 
-echo "[*] Installing/Upgrading required packages..."
+echo "[*] Installing Python packages into venv (mutagen, musicbrainzngs, requests, Pillow, rich, tqdm)..."
 pip install --upgrade pip >/dev/null
-pip install --upgrade mutagen musicbrainzngs requests Pillow tqdm blessed >/dev/null
+pip install mutagen musicbrainzngs requests Pillow rich tqdm >/dev/null
 
-# --- Start the main worker Python script ---
-python3 - <<'PY'
-import os, json, threading, time, queue, musicbrainzngs, mutagen, sys
-from mutagen.easyid3 import EasyID3
-from mutagen.mp3 import MP3
-from PIL import Image
-import io, requests
-from tqdm import tqdm
-from blessed import Terminal
+# ----- Write Python worker -----
+cat > "$PY_FILE" <<'PYCODE'
+#!/usr/bin/env python3
+"""
+trackfix_tui.py — NightmareBD version
+Multi-threaded interactive TrackFix worker with Rich TUI.
+"""
 
-# CONFIG
-MUSIC_DIR = "/mnt/HDD/Media/Music"
-STATE_FILE = ".trackfix_state.json"
-THREADS = 4
+import os, sys, json, time, traceback, threading
+from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor
+from queue import Queue
+from rich.live import Live
+from rich.table import Table
+from rich.console import Console
+from rich.panel import Panel
+from rich.progress import Progress, BarColumn, TextColumn, TimeElapsedColumn, TimeRemainingColumn
+from rich.align import Align
+from rich.text import Text
+import mutagen, musicbrainzngs, requests
+from mutagen.id3 import ID3, APIC
+from mutagen.flac import FLAC, Picture
+from mutagen.mp4 import MP4, MP4Cover
 
-term = Terminal()
-lock = threading.Lock()
-q = queue.Queue()
-stats = {"total":0,"processed":0,"recovered":0,"skipped":0,"failed":0,"corrupted":0}
+MUSIC_FOLDER = Path(os.environ.get("TRACKFIX_MUSIC_FOLDER", "/mnt/HDD/Media/Music"))
+STATE_FILE = MUSIC_FOLDER / ".trackfix_state.json"
+LOG_FILE = Path(os.environ.get("TRACKFIX_LOG_FILE", "./trackfix.log"))
+THREADS = int(os.environ.get("TRACKFIX_THREADS", "8"))
+FIX_PERMS = os.environ.get("TRACKFIX_FIX_PERMS", "false") == "true"
+DELETE_FAILED = os.environ.get("TRACKFIX_DELETE_FAILED", "false") == "true"
+AUTO_RENAME = os.environ.get("TRACKFIX_AUTO_RENAME", "false") == "true"
+EMBED_COVER = os.environ.get("TRACKFIX_EMBED_COVER", "false") == "true"
+FETCH_GENRE_YEAR = os.environ.get("TRACKFIX_FETCH_GENRE_YEAR", "false") == "true"
+AUTO_DRY_REAL = os.environ.get("TRACKFIX_AUTO_DRY_REAL", "false") == "true"
+RESUMABLE = os.environ.get("TRACKFIX_RESUMABLE", "true") == "true"
 
-# --- Init MusicBrainz ---
-musicbrainzngs.set_useragent("TrackFix", "1.0", "nightmarebd@example.com")
+musicbrainzngs.set_useragent("TrackFix", "1.0", "trackfix@example.com")
 
-# --- Load or create state ---
-processed = set()
-if os.path.exists(STATE_FILE):
-    with open(STATE_FILE) as f:
-        try: processed = set(json.load(f))
-        except: processed = set()
+console = Console()
+log_q = Queue()
 
-# --- Collect files ---
-for root, dirs, files in os.walk(MUSIC_DIR):
-    for f in files:
-        if f.lower().endswith((".mp3",".flac",".m4a",".wav",".ogg")):
-            full = os.path.join(root, f)
-            if full not in processed:
-                q.put(full)
-stats["total"] = q.qsize()
+def log(msg):
+    ts = time.strftime("%Y-%m-%d %H:%M:%S")
+    log_q.put(f"[{ts}] {msg}")
+    with open(LOG_FILE, "a") as f:
+        f.write(f"[{ts}] {msg}\n")
 
-def safe_filename(txt):
-    import re
-    return re.sub(r'[\\/*?:"<>|]', '', txt.strip())
+def safe_name(s):
+    return "".join(c if c.isalnum() or c in " .-_()[]" else "_" for c in (s or "")).strip()
 
-def fetch_metadata(file):
+# Load or init state
+state_lock = threading.Lock()
+if STATE_FILE.exists():
     try:
-        audio = MP3(file, ID3=EasyID3)
-        title = audio.get('title', [None])[0]
-        artist = audio.get('artist', [None])[0]
-        album = audio.get('album', [None])[0]
-
-        if not title or not artist:
-            name = os.path.basename(file).rsplit('.',1)[0]
-            res = musicbrainzngs.search_recordings(recording=name, limit=1)
-            if res.get('recording-list'):
-                rec = res['recording-list'][0]
-                title = rec.get('title', title)
-                artist = rec['artist-credit'][0]['artist']['name'] if 'artist-credit' in rec else artist
-                album = rec.get('release-list',[{}])[0].get('title', album)
-        return {
-            "title": title or "Unknown Title",
-            "artist": artist or "Unknown Artist",
-            "album": album or "Unknown Album"
-        }
+        with STATE_FILE.open("r") as f:
+            processed_set = set(json.load(f))
     except Exception:
-        return None
+        processed_set = set()
+else:
+    processed_set = set()
 
-# ✅ File rename pattern fixed: Title - Album - Artist
-def rename_file(file, metadata):
-    try:
-        title = safe_filename(metadata["title"])
-        album = safe_filename(metadata["album"])
-        artist = safe_filename(metadata["artist"])
-        new_name = f"{title} - {album} - {artist}.mp3"
-        new_dir = os.path.join(MUSIC_DIR, artist, album)
-        os.makedirs(new_dir, exist_ok=True)
-        new_path = os.path.join(new_dir, new_name)
-        os.rename(file, new_path)
-        return new_path
-    except Exception:
-        return None
-
-def worker(tid):
-    while not q.empty():
-        file = q.get()
+def save_state():
+    with state_lock:
         try:
-            meta = fetch_metadata(file)
-            if not meta:
-                stats["failed"] += 1
-                continue
-            new_path = rename_file(file, meta)
-            if not new_path:
-                stats["failed"] += 1
-            else:
-                stats["recovered"] += 1
-            with lock:
-                processed.add(file)
-                stats["processed"] += 1
-                with open(STATE_FILE,"w") as f: json.dump(list(processed), f)
-        except Exception:
-            stats["failed"] += 1
-        q.task_done()
+            with STATE_FILE.open("w") as f:
+                json.dump(list(processed_set), f)
+        except Exception as e:
+            log(f"Failed to save state: {e}")
 
-threads = [threading.Thread(target=worker,args=(i+1,)) for i in range(THREADS)]
-for t in threads: t.start()
+def fetch_cover(release_mbid):
+    try:
+        url = f"https://coverartarchive.org/release/{release_mbid}/front-500"
+        r = requests.get(url, timeout=10)
+        if r.status_code == 200:
+            return r.content
+    except Exception as e:
+        log(f"Cover fetch error {release_mbid}: {e}")
+    return None
 
-with term.fullscreen(), term.cbreak(), term.hidden_cursor():
-    while any(t.is_alive() for t in threads):
-        with lock:
-            pct = (stats["processed"]/stats["total"]*100) if stats["total"]>0 else 0
-            bar = int(pct/2)
-            print(term.clear())
-            print(term.bold_red("🩸 NightmareBD — TrackFix Dashboard"))
-            print(f"Total: {stats['total']} | Processed: {stats['processed']} | Recovered: {stats['recovered']} | Failed: {stats['failed']}")
-            print(f"Progress: [{term.red('#'*bar)}{term.white('-'*(50-bar))}] {pct:.2f}%")
-            print(term.yellow(f"Threads Active: {sum(t.is_alive() for t in threads)}"))
-        time.sleep(1)
+def process_file_worker(file_path: str, thread_id: int, stats: dict, dry_run=True):
+    stats['thread_current'][thread_id] = file_path
+    stats['thread_count'][thread_id] += 1
 
-for t in threads: t.join()
-print(term.green("\n✅ All processing complete!"))
-PY
+    try:
+        audio = mutagen.File(file_path, easy=True)
+        if audio is None:
+            stats['skipped'] += 1
+            log(f"SKIP unsupported: {file_path}")
+            return
+
+        title = audio.get("title", [None])[0]
+        artist = audio.get("artist", [None])[0]
+        if not title or not artist:
+            stats['skipped'] += 1
+            log(f"SKIP no title/artist: {file_path}")
+            return
+
+        try:
+            res = musicbrainzngs.search_recordings(recording=title, artist=artist, limit=1)
+        except Exception as e:
+            log(f"MB search error for {file_path}: {e}")
+            stats['failed'] += 1
+            return
+
+        recs = res.get("recording-list", [])
+        if not recs:
+            stats['failed'] += 1
+            log(f"MB no match: {file_path}")
+            return
+
+        rec = recs[0]
+        release = rec.get("release-list", [{}])[0]
+        album_title = release.get("title", None) or "Unknown Album"
+        date = release.get("date", None)
+        tags = release.get("tag-list", [])
+        genre = ", ".join(tag.get("name") for tag in tags) if tags else None
+        release_mbid = release.get("id", None)
+
+        if dry_run:
+            stats['simulated'] += 1
+            log(f"[DRY] Would update: {file_path} -> album:{album_title} date:{date} genre:{genre}")
+            return
+
+        try:
+            ext = Path(file_path).suffix.lower()
+            audio = mutagen.File(file_path, easy=True)
+            if album_title: audio["album"] = album_title
+            if date: audio["date"] = date
+            if genre: audio["genre"] = genre
+            audio.save()
+
+            if EMBED_COVER and release_mbid:
+                img = fetch_cover(release_mbid)
+                if img:
+                    if ext == ".mp3":
+                        try:
+                            id3 = ID3(file_path)
+                            id3.delall("APIC")
+                            id3.add(APIC(encoding=3, mime="image/jpeg", type=3, desc="Cover", data=img))
+                            id3.save(file_path)
+                        except Exception as e:
+                            log(f"Cover embed failed MP3: {e}")
+                    elif ext == ".flac":
+                        try:
+                            f = FLAC(file_path)
+                            pic = Picture()
+                            pic.data = img
+                            pic.mime = "image/jpeg"
+                            pic.type = 3
+                            f.clear_pictures()
+                            f.add_picture(pic)
+                            f.save()
+                        except Exception as e:
+                            log(f"Cover embed FLAC failed: {e}")
+                    elif ext in (".m4a", ".mp4"):
+                        try:
+                            mp4 = MP4(file_path)
+                            mp4["covr"] = [MP4Cover(img, imageformat=MP4Cover.FORMAT_JPEG)]
+                            mp4.save()
+                        except Exception as e:
+                            log(f"Cover embed MP4 failed: {e}")
+        except Exception as e:
+            stats['failed'] += 1
+            log(f"Write metadata error {file_path}: {e}")
+            return
+
+        if AUTO_RENAME:
+            try:
+                art = safe_name(artist)
+                alb = safe_name(album_title)
+                tit = safe_name(title)
+                new_name = f"{tit} - {alb} - {art}{Path(file_path).suffix}"
+                new_path = Path(file_path).parent / new_name
+                if new_path != Path(file_path):
+                    os.rename(file_path, new_path)
+                    stats['renamed'] += 1
+                    log(f"Renamed: {file_path} -> {new_path}")
+                    file_path = str(new_path)
+            except Exception as e:
+                log(f"Rename failed {file_path}: {e}")
+
+        stats['recovered'] += 1
+        log(f"Recovered: {file_path}")
+
+    except Exception as e:
+        stats['corrupted'] += 1
+        log(f"Processing exception {file_path}: {e}\n{traceback.format_exc()}")
+
+def build_file_list(root: Path):
+    exts = {".mp3", ".flac", ".m4a", ".ogg", ".wav"}
+    return [str(p) for p in root.rglob("*") if p.suffix.lower() in exts]
+
+def run_workers(files, dry_run=True):
+    stats = {
+        'processed': 0, 'recovered': 0, 'renamed': 0,
+        'simulated': 0, 'skipped': 0, 'failed': 0, 'corrupted': 0,
+        'thread_current': {i+1: "" for i in range(THREADS)},
+        'thread_count': {i+1: 0 for i in range(THREADS)},
+    }
+
+    progress = Progress(
+        TextColumn("[progress.description]{task.description}"),
+        BarColumn(),
+        TextColumn("[progress.percentage]{task.percentage:>3.0f}%"),
+        TimeElapsedColumn(),
+        TimeRemainingColumn(),
+        console=console,
+    )
+    task = progress.add_task("Overall", total=len(files))
+
+    with ThreadPoolExecutor(max_workers=THREADS) as executor, Live(console=console, refresh_per_second=10) as live:
+        futures = {executor.submit(process_file_worker, f, (i % THREADS)+1, stats, dry_run): f for i, f in enumerate(files)}
+        while futures:
+            table = Table.grid()
+            table.add_row(Text("NightmareBD — TrackFix", style="bold magenta"))
+            counts = f"Processed: {stats['processed']} | Recovered: {stats['recovered']} | Renamed: {stats['renamed']} | Simulated: {stats['simulated']} | Skipped: {stats['skipped']} | Failed: {stats['failed']} | Corrupted: {stats['corrupted']}"
+            table.add_row(Text(counts, style="yellow"))
+            t = Table(title="Threads", expand=True)
+            t.add_column("TID", justify="right")
+            t.add_column("Count", justify="right")
+            t.add_column("Current file")
+            for tid in range(1, THREADS+1):
+                t.add_row(str(tid), str(stats['thread_count'][tid]), stats['thread_current'][tid][:80])
+            table.add_row(t)
+            with open(LOG_FILE, "r", errors="ignore") as lf:
+                tail = lf.read().splitlines()[-8:]
+            table.add_row(Panel("\n".join(tail), title="Log tail", height=8))
+            live.update(Panel.fit(table, border_style="green"))
+
+            done = [f for f in futures if f.done()]
+            for f in done:
+                futures.pop(f)
+                stats['processed'] += 1
+                progress.update(task, advance=1)
+            time.sleep(0.1)
+    save_state()
+    return stats
+
+def main():
+    if FIX_PERMS:
+        for p in MUSIC_FOLDER.rglob("*"): 
+            try: p.chmod(0o777)
+            except: pass
+        log(f"Permissions fixed under {MUSIC_FOLDER}")
+    files = build_file_list(MUSIC_FOLDER)
+    log(f"Discovered {len(files)} audio files under {MUSIC_FOLDER}")
+    dry_run = True
+    stats = run_workers(files, dry_run=dry_run)
+    log(f"Finished: {stats}")
+    console.print(Panel(Text("TrackFix finished — check log for details", style="bold green")))
+    save_state()
+
+if __name__ == "__main__":
+    try:
+        main()
+    except KeyboardInterrupt:
+        log("Interrupted by user")
+        save_state()
+    except Exception as e:
+        log(f"Fatal: {e}\n{traceback.format_exc()}")
+        save_state()
+PYCODE
+
+chmod +x "$PY_FILE"
+
+export TRACKFIX_MUSIC_FOLDER="$MUSIC_FOLDER"
+export TRACKFIX_THREADS="$THREADS"
+export TRACKFIX_FIX_PERMS="$FIX_PERMS"
+export TRACKFIX_DELETE_FAILED="$DELETE_FAILED"
+export TRACKFIX_AUTO_RENAME="$AUTO_RENAME"
+export TRACKFIX_EMBED_COVER="$EMBED_COVER"
+export TRACKFIX_FETCH_GENRE_YEAR="$FETCH_GENRE_YEAR"
+export TRACKFIX_AUTO_DRY_REAL="$AUTO_DRY_REAL"
+export TRACKFIX_RESUMABLE="$RESUMABLE"
+export TRACKFIX_LOG_FILE="$LOG_FILE"
+
+echo "[*] Starting TrackFix Python TUI..."
+python "$PY_FILE"
+echo "[*] TrackFix finished. Logs: $LOG_FILE"
