@@ -1,4 +1,4 @@
-# NightmareBD Music Recovery /Track Fix
+# Music Recovery /Track Fix /Metadata
 
 **Track Fix** is a fully automated, multi-threaded music metadata recovery and organization tool.  
 It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBrainz, renames files, fixes permissions, deletes corrupted files, and provides a real-time interactive console GUI with live progress stats.
