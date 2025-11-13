@@ -1,41 +1,76 @@
-# NightmareBD Track Fix
+#!/bin/bash
 
-**Track Fix** is a fully automated, multi-threaded music metadata recovery and organization tool.  
-It fetches metadata (Artist, Album, Title, Year, Genre, Cover Art) from MusicBrainz, renames files, fixes permissions, deletes corrupted files, and provides a real-time interactive console GUI with live progress stats.
+# --- Configuration ---
+# Set the name of the main Python script
+PYTHON_SCRIPT="track_fix.py"
+# Set the name of the Python Virtual Environment directory
+VENV_DIR=".venv"
+# Check if Python 3.13 is available, if not, use the standard python3
+if command -v python3.13 &> /dev/null
+then
+    PYTHON_EXEC="python3.13"
+else
+    PYTHON_EXEC="python3"
+fi
 
----
+# --- Functions ---
 
-## Features
+# Function to check for required commands
+check_command() {
+    if ! command -v "$1" &> /dev/null
+    then
+        echo "Error: Required command '$1' not found. Please install it."
+        exit 1
+    fi
+}
 
-- **NightmareBD ASCII banner** on startup.
-- **Dynamic music folder selection** at runtime.
-- **Resumable** using `.processed_files.json` to continue after crashes.
-- **Multi-threaded processing** (8 threads by default) for speed.
-- **Fetches metadata**: Artist, Album, Title, Year, Genre.
-- **Fetches album cover art** and embeds in audio files.
-- **Auto renames files** to `Artist - Album - Title`.
-- **Auto deletes corrupted/unreadable files**.
-- **Auto fixes permissions and ownership** (`chown nobody:nogroup`, `chmod 777` recursively).
-- **Interactive console GUI** with live stats, progress per thread, and file counts.
-- **Dry-run / Real mode** integrated; automatically switches between modes if needed.
-- Supports multiple formats: **MP3, FLAC, M4A/MP4, OGG**.
-- **Crash-resume support** ensures you never lose progress.
+# Function to set up the virtual environment
+setup_venv() {
+    echo "--- Setting up Python Virtual Environment ---"
+    # Check if a virtual environment already exists
+    if [ ! -d "$VENV_DIR" ]; then
+        echo "Creating virtual environment in $VENV_DIR..."
+        "$PYTHON_EXEC" -m venv "$VENV_DIR"
+        if [ $? -ne 0 ]; then
+            echo "Error creating virtual environment. Ensure $PYTHON_EXEC and 'venv' module are installed."
+            exit 1
+        fi
+    fi
+    
+    # Activate the virtual environment (syntax differs slightly for sub-shells)
+    # We use the full path to activate for simplicity within the script
+    source "$VENV_DIR/bin/activate"
 
----
+    # Install dependencies
+    echo "Installing required Python dependencies from requirements.txt..."
+    pip install --upgrade pip
+    pip install -r requirements.txt
+    
+    if [ $? -ne 0 ]; then
+        echo "Error installing dependencies. Check requirements.txt or internet connection."
+        deactivate # Deactivate on failure
+        exit 1
+    fi
+}
 
-## Requirements
+# --- Main Execution ---
 
-- Python 3.13+  
-- Bash shell  
-- `pip` (will be auto-installed if missing)  
-- Internet connection (for MusicBrainz metadata and cover art)
+# 1. Clean up old errors/documentation from the script start
+echo "# NightmareBD Track Fix Utility"
 
----
+# 2. Check for basic requirements
+check_command "$PYTHON_EXEC"
+check_command "pip"
 
-## Installation & Usage
+# 3. Set up environment and install dependencies
+setup_venv
 
-1. Clone this repository:
+# 4. Run the main Python script
+echo "--- Starting Track Fix Utility ---"
+# Pass all command-line arguments (like 'dry-run' or file paths) to the Python script
+"$PYTHON_EXEC" "$PYTHON_SCRIPT" "$@"
 
-```bash
-git clone https://github.com/nightmarebd/track_fix.git
-cd track_fix
+# 5. Deactivate the virtual environment
+deactivate
+
+echo "--- Script finished ---"
